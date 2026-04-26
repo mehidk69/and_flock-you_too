@@ -23,6 +23,21 @@
 #define MIRROR_TX_PIN    43
 #define MIRROR_BAUD      115200
 
+// On-device GPS (UART NMEA module wired to UART2). Stays out of the WiFi
+// callback path entirely — only loop() reads bytes and parses lines, and
+// detections capture the most-recent valid fix at emit time.
+//
+// Wiring (Seeed XIAO ESP32-S3):
+//   GPS VCC → 5V (or 3V3)        Module's onboard regulator handles both.
+//   GPS GND → GND
+//   GPS TX  → D7 / GPIO44        ← we read this
+//   GPS RX  → leave floating     We never transmit to the module.
+#define USE_GPS                1
+#define GPS_RX_PIN             44
+#define GPS_BAUD               9600
+#define GPS_UART_NUM           2
+#define GPS_FIX_TIMEOUT_MS     10000   // mark fix stale after this many ms with no update
+
 #define CHANNEL_MODE_FULL_HOP   0
 #define CHANNEL_MODE_CUSTOM     1
 #define CHANNEL_MODE_SINGLE     2
@@ -173,7 +188,28 @@ typedef struct {
   uint32_t lastSeen;       // millis() at latest hit
   uint16_t count;
   char     ssid[33];       // "" unless an SSID hit populated it
+  // GPS at most-recent sighting. hasGps == false means no fix at any sighting.
+  bool     hasGps;
+  float    lat;
+  float    lon;
+  float    hdop;
+  uint8_t  gpsFixQuality;  // GGA fix quality (0=invalid, 1=GPS, 2=DGPS, ...)
+  uint8_t  gpsSatellites;
 } FYDetection;
+
+// Most-recent GPS fix from the on-device module. Updated only by gpsTick()
+// in loop() — single-writer, single-reader; loop() also reads it. No mutex.
+typedef struct {
+  bool     valid;
+  float    lat;
+  float    lon;
+  float    altitude;       // metres
+  float    hdop;
+  uint8_t  fixQuality;
+  uint8_t  satellites;
+  uint32_t lastUpdateMs;
+} FYGpsFix;
+static FYGpsFix gpsFix = {0};
 
 static FYDetection fyDet[MAX_DETECTIONS];
 static int           fyDetCount       = 0;
@@ -231,7 +267,7 @@ typedef struct __attribute__((packed)) {
 // ============================================================
 
 // Dual-output: prints to both Serial (USB) and Serial1 (GPIO43)
-static char _dualBuf[384];
+static char _dualBuf[640];
 
 static void dualPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void dualPrintf(const char* fmt, ...) {
@@ -442,11 +478,195 @@ static void updateChannelMode() {
 
 static void printHeartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
+#if USE_GPS
+    if (gpsFix.valid) {
+      dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d gps=%.6f,%.6f sats=%u hdop=%.1f)\n",
+                 currentChannel, channelModeName(), fyDetCount,
+                 gpsFix.lat, gpsFix.lon,
+                 (unsigned)gpsFix.satellites, gpsFix.hdop);
+    } else {
+      dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d gps=no_fix)\n",
+                 currentChannel, channelModeName(), fyDetCount);
+    }
+#else
     dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d)\n",
                   currentChannel, channelModeName(), fyDetCount);
+#endif
     lastHeartbeat = millis();
   }
 }
+
+// ============================================================
+// GPS  (UART NMEA reader, parser, fix state)
+// ============================================================
+//
+// All work happens in loop() via gpsTick() — bytes are pulled from UART2,
+// buffered into a line, and parsed once a newline arrives. No malloc, no
+// floating-point in the ISR (there is no ISR — it's all polled). Two NMEA
+// sentence types are consumed:
+//
+//   $G[PNL]GGA   — fix quality, sats, lat, lon, alt, HDOP
+//   $G[PNL]RMC   — fix status (A/V), lat, lon  (used as fallback if GGA absent)
+//
+// The talker prefix varies (GPS=GP, GLONASS=GL, mixed=GN) so we match on the
+// last three chars of the sentence id.
+
+#if USE_GPS
+static HardwareSerial GPSSerial(GPS_UART_NUM);
+
+#define GPS_LINE_MAX 96
+static char     gpsLine[GPS_LINE_MAX];
+static size_t   gpsLineLen = 0;
+
+static bool nmeaChecksumValid(const char* line) {
+  // Expect: "$....*HH"  — XOR of all bytes between $ and *.
+  if (line[0] != '$') return false;
+  uint8_t sum = 0;
+  size_t i = 1;
+  for (; line[i] && line[i] != '*'; i++) sum ^= (uint8_t)line[i];
+  if (line[i] != '*') return false;
+  unsigned given = 0;
+  if (sscanf(line + i + 1, "%2x", &given) != 1) return false;
+  return ((uint8_t)given) == sum;
+}
+
+// "ddmm.mmmm" → decimal degrees. Returns NAN on bad input.
+static float nmeaParseLatLon(const char* s, char hemi) {
+  if (!s || !*s) return NAN;
+  const char* dot = strchr(s, '.');
+  if (!dot) return NAN;
+  // Degrees = everything up to the last 2 digits before '.'
+  int intLen = (int)(dot - s);
+  if (intLen < 3) return NAN;        // need at least 1 digit deg + 2 digit min
+  int degLen = intLen - 2;
+  char degBuf[5] = {0};
+  if (degLen >= (int)sizeof(degBuf)) return NAN;
+  memcpy(degBuf, s, degLen);
+  float deg = (float)atoi(degBuf);
+  float min = (float)atof(s + degLen);
+  float val = deg + (min / 60.0f);
+  if (hemi == 'S' || hemi == 'W') val = -val;
+  return val;
+}
+
+// Split a comma-separated NMEA payload (after the leading $...,)
+// into pointers to each field. Returns field count. Modifies `line`.
+static int nmeaSplit(char* line, char* fields[], int maxFields) {
+  int n = 0;
+  fields[n++] = line;
+  for (char* p = line; *p; p++) {
+    if (*p == ',') {
+      *p = '\0';
+      if (n < maxFields) fields[n++] = p + 1;
+    } else if (*p == '*') {
+      *p = '\0';
+      break;
+    }
+  }
+  return n;
+}
+
+// Parse one NMEA line. Updates gpsFix on a valid GGA / RMC sentence.
+static void nmeaConsumeLine(char* line) {
+  if (!nmeaChecksumValid(line)) return;
+  if (line[0] != '$' || strlen(line) < 7) return;
+
+  // $XXNNN,...  — XX = talker ("GP"/"GL"/"GN"/etc.), NNN = sentence type
+  const char* sid = line + 3;          // points at NNN
+  bool isGGA = (sid[0] == 'G' && sid[1] == 'G' && sid[2] == 'A');
+  bool isRMC = (sid[0] == 'R' && sid[1] == 'M' && sid[2] == 'C');
+  if (!isGGA && !isRMC) return;
+
+  // Skip the "$XXNNN," prefix before splitting fields.
+  char* body = strchr(line, ',');
+  if (!body) return;
+  body++;
+
+  char* f[20] = {0};
+  int nf = nmeaSplit(body, f, 20);
+
+  if (isGGA) {
+    // GGA: time, lat, ns, lon, ew, fix, sats, hdop, alt, M, ...
+    if (nf < 9) return;
+    int fix = (f[5] && f[5][0]) ? atoi(f[5]) : 0;
+    if (fix == 0) {
+      gpsFix.valid      = false;
+      gpsFix.fixQuality = 0;
+      // Don't blow away last lat/lon — keep them stale-but-readable for
+      // post-mortem; gpsFix.valid=false is the gate downstream code uses.
+      return;
+    }
+    float lat = nmeaParseLatLon(f[1], f[2] ? f[2][0] : 'N');
+    float lon = nmeaParseLatLon(f[3], f[4] ? f[4][0] : 'E');
+    if (isnan(lat) || isnan(lon)) return;
+    gpsFix.lat          = lat;
+    gpsFix.lon          = lon;
+    gpsFix.fixQuality   = (uint8_t)fix;
+    gpsFix.satellites   = (uint8_t)((f[6] && f[6][0]) ? atoi(f[6]) : 0);
+    gpsFix.hdop         = (f[7] && f[7][0]) ? (float)atof(f[7]) : 99.9f;
+    gpsFix.altitude     = (f[8] && f[8][0]) ? (float)atof(f[8]) : 0.0f;
+    gpsFix.lastUpdateMs = millis();
+    gpsFix.valid        = true;
+  } else if (isRMC) {
+    // RMC: time, status (A=valid V=warning), lat, ns, lon, ew, ...
+    if (nf < 6) return;
+    if (!f[1] || f[1][0] != 'A') {
+      gpsFix.valid = false;
+      return;
+    }
+    // Only fill in lat/lon from RMC if GGA hasn't already given us a fresher
+    // fix this second — keeps GGA's HDOP/sats/alt as the authoritative record.
+    if (millis() - gpsFix.lastUpdateMs < 500 && gpsFix.valid) return;
+    float lat = nmeaParseLatLon(f[2], f[3] ? f[3][0] : 'N');
+    float lon = nmeaParseLatLon(f[4], f[5] ? f[5][0] : 'E');
+    if (isnan(lat) || isnan(lon)) return;
+    gpsFix.lat          = lat;
+    gpsFix.lon          = lon;
+    if (gpsFix.fixQuality == 0) gpsFix.fixQuality = 1;
+    gpsFix.lastUpdateMs = millis();
+    gpsFix.valid        = true;
+  }
+}
+
+static void gpsTick() {
+  // Drain whatever's in the UART buffer this loop pass.
+  while (GPSSerial.available()) {
+    int c = GPSSerial.read();
+    if (c < 0) break;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (gpsLineLen > 0) {
+        gpsLine[gpsLineLen] = '\0';
+        nmeaConsumeLine(gpsLine);
+        gpsLineLen = 0;
+      }
+      continue;
+    }
+    if (gpsLineLen < GPS_LINE_MAX - 1) {
+      gpsLine[gpsLineLen++] = (char)c;
+    } else {
+      // Overflow — bail on this line, wait for the next \n.
+      gpsLineLen = 0;
+    }
+  }
+  // Stale-fix expiry: if the module stops emitting, don't keep tagging
+  // detections with last-known coords forever.
+  if (gpsFix.valid && (millis() - gpsFix.lastUpdateMs) > GPS_FIX_TIMEOUT_MS) {
+    gpsFix.valid = false;
+  }
+}
+
+// HDOP → metres heuristic. u-blox spec: position accuracy ≈ HDOP × UERE
+// (~5 m for consumer single-frequency). Floor at 2.5 m to match typical
+// achievable accuracy under good sky view.
+static float gpsAccuracyMetres(float hdop) {
+  if (hdop <= 0.0f || isnan(hdop)) return 99.0f;
+  float a = hdop * 5.0f;
+  return (a < 2.5f) ? 2.5f : a;
+}
+#else
+static inline void gpsTick() {}
+#endif
 
 // ============================================================
 // DETECTION TABLE OPS
@@ -482,6 +702,16 @@ static int fyAddDetection(const char* mac, const char* method,
       if (ssid && ssid[0] && !fyDet[i].ssid[0]) {
         strlcpy(fyDet[i].ssid, ssid, sizeof(fyDet[i].ssid));
       }
+#if USE_GPS
+      if (gpsFix.valid) {
+        fyDet[i].hasGps        = true;
+        fyDet[i].lat           = gpsFix.lat;
+        fyDet[i].lon           = gpsFix.lon;
+        fyDet[i].hdop          = gpsFix.hdop;
+        fyDet[i].gpsFixQuality = gpsFix.fixQuality;
+        fyDet[i].gpsSatellites = gpsFix.satellites;
+      }
+#endif
       fyDirty = true;
       if (outChirpWorthy) *outChirpWorthy = rediscover;
       return i;
@@ -501,6 +731,17 @@ static int fyAddDetection(const char* mac, const char* method,
   d.count     = 1;
   if (ssid && ssid[0]) strlcpy(d.ssid, ssid, sizeof(d.ssid));
   else                 d.ssid[0] = '\0';
+  d.hasGps = false;
+#if USE_GPS
+  if (gpsFix.valid) {
+    d.hasGps        = true;
+    d.lat           = gpsFix.lat;
+    d.lon           = gpsFix.lon;
+    d.hdop          = gpsFix.hdop;
+    d.gpsFixQuality = gpsFix.fixQuality;
+    d.gpsSatellites = gpsFix.satellites;
+  }
+#endif
   fyDetCount++;
   fyDirty = true;
   if (outChirpWorthy) *outChirpWorthy = true;
@@ -568,17 +809,26 @@ static uint32_t fyCRC32Update(uint32_t crc, const uint8_t* data, size_t len) {
 static size_t fySerializeDet(const FYDetection& d, char* dst, size_t cap) {
   char ssidEsc[sizeof(d.ssid) * 6 + 1];
   jsonEscape(ssidEsc, sizeof(ssidEsc), d.ssid);
+  char gpsBuf[160];
+  gpsBuf[0] = '\0';
+  if (d.hasGps) {
+    snprintf(gpsBuf, sizeof(gpsBuf),
+        ",\"gps\":{\"lat\":%.7f,\"lon\":%.7f,\"hdop\":%.2f,"
+        "\"fix\":%u,\"sats\":%u}",
+        d.lat, d.lon, d.hdop,
+        (unsigned)d.gpsFixQuality, (unsigned)d.gpsSatellites);
+  }
   int n = snprintf(dst, cap,
       "{\"mac\":\"%s\",\"method\":\"%s\",\"rssi\":%d,\"channel\":%u,"
-      "\"first\":%lu,\"last\":%lu,\"count\":%u,\"ssid\":\"%s\"}",
+      "\"first\":%lu,\"last\":%lu,\"count\":%u,\"ssid\":\"%s\"%s}",
       d.mac, d.method, d.rssi, (unsigned)d.channel,
       (unsigned long)d.firstSeen, (unsigned long)d.lastSeen, (unsigned)d.count,
-      ssidEsc);
+      ssidEsc, gpsBuf);
   return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
 static uint32_t fyComputePayloadCRC(size_t& outBytes) {
-  char line[384];
+  char line[512];
   uint32_t crc = 0;
   outBytes = 0;
   crc = fyCRC32Update(crc, (const uint8_t*)"[", 1); outBytes += 1;
@@ -678,10 +928,14 @@ static void fySaveSession() {
     dualPrintf("[flockyou] save failed: cannot open %s\n", FY_SESSION_TMP);
     return;
   }
-  f.printf("{\"v\":1,\"count\":%d,\"bytes\":%u,\"crc\":\"0x%08lX\"}\n",
+  // v:2 — adds optional per-entry "gps" sub-object {lat,lon,hdop,fix,sats}.
+  // Entries without a GPS fix at sighting omit the field entirely, so a v:2
+  // file without any fixes is byte-identical to what v:1 would have produced
+  // apart from the version number.
+  f.printf("{\"v\":2,\"count\":%d,\"bytes\":%u,\"crc\":\"0x%08lX\"}\n",
            savedCount, (unsigned)payloadBytes, (unsigned long)crc);
 
-  char line[384];
+  char line[512];
   size_t wrote = 0;
   f.write((uint8_t*)"[", 1); wrote++;
   for (int i = 0; i < fyDetCount; i++) {
@@ -757,8 +1011,9 @@ static void fyPromotePrevSession() {
 // and extracts these fields:  mac_address, rssi, channel, frequency, ssid,
 // device_name, gps.latitude, gps.longitude, gps.accuracy.
 //
-// GPS is handled Flask-side via its own USB NMEA puck or browser geolocation;
-// we don't embed GPS here because there's no on-device AP / phone link.
+// When the on-device GPS has a valid fix, we embed it as a `gps` sub-object
+// here. Flask already maps that into its detection record (see flockyou.py
+// "esp_gps = data.get('gps')") so no Flask change is required.
 
 static void emitDetectionJSON(const char* mac, const char* method,
                               int8_t rssi, uint8_t ch, const char* ssid) {
@@ -770,6 +1025,20 @@ static void emitDetectionJSON(const char* mac, const char* method,
          &mbytes[0], &mbytes[1], &mbytes[2], &mbytes[3], &mbytes[4], &mbytes[5]);
   ouiFromMac(mbytes, oui, sizeof(oui));
 
+  char gpsBuf[160];
+  gpsBuf[0] = '\0';
+#if USE_GPS
+  if (gpsFix.valid) {
+    snprintf(gpsBuf, sizeof(gpsBuf),
+        ",\"gps\":{\"latitude\":%.7f,\"longitude\":%.7f,"
+        "\"accuracy\":%.1f,\"altitude\":%.1f,\"hdop\":%.2f,"
+        "\"satellites\":%u,\"fix_quality\":%u}",
+        gpsFix.lat, gpsFix.lon,
+        gpsAccuracyMetres(gpsFix.hdop), gpsFix.altitude, gpsFix.hdop,
+        (unsigned)gpsFix.satellites, (unsigned)gpsFix.fixQuality);
+  }
+#endif
+
   dualPrintf(
       "{\"event\":\"detection\","
       "\"detection_method\":\"wifi_%s\","
@@ -780,9 +1049,9 @@ static void emitDetectionJSON(const char* mac, const char* method,
       "\"rssi\":%d,"
       "\"channel\":%u,"
       "\"frequency\":%u,"
-      "\"ssid\":\"%s\"}\n",
+      "\"ssid\":\"%s\"%s}\n",
       method, mac, oui, rssi,
-      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc);
+      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc, gpsBuf);
 }
 
 // ============================================================
@@ -1053,6 +1322,12 @@ void setup() {
   Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN);  // TX-only on GPIO43
 #endif
 
+#if USE_GPS
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, -1);  // RX-only
+  dualPrintf("[flockyou] GPS UART%u listening on GPIO%u @ %u baud\n",
+             (unsigned)GPS_UART_NUM, (unsigned)GPS_RX_PIN, (unsigned)GPS_BAUD);
+#endif
+
 #if USE_BUZZER
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
@@ -1113,6 +1388,7 @@ void setup() {
 
 void loop() {
   updateChannelMode();
+  gpsTick();           // drain UART2, parse NMEA, refresh gpsFix
   drainAlertQueue();   // Serial.printf happens here, not in callback
   autosaveTick();      // periodic SPIFFS write if dirty
   heartbeatTick();     // audible beep-pair while a target is still in range

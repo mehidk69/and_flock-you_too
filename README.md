@@ -127,9 +127,11 @@ Full dataset and methodology: [`datasets/NitekryDPaul_wifi_ouis.md`](datasets/Ni
 On-flash layout, atomic and crash-safe:
 
 ```
-Line 1: {"v":1,"count":N,"bytes":B,"crc":"0xXXXXXXXX"}
-Line 2: [{"mac":"...","method":"...","rssi":...,...},...]
+Line 1: {"v":2,"count":N,"bytes":B,"crc":"0xXXXXXXXX"}
+Line 2: [{"mac":"...","method":"...","rssi":...,"gps":{"lat":...,"lon":...,"hdop":...,"fix":1,"sats":8},...},...]
 ```
+
+`v:2` adds an optional per-entry `gps` sub-object captured at the most recent sighting. Entries without a fix omit the field entirely. Older `v:1` files written by previous firmware are still readable by external tools (the only difference is the version tag and the absence of `gps`).
 
 Save procedure:
 
@@ -168,12 +170,24 @@ The firmware emits one JSON line per detection in the same schema the BLE detect
 
 ### GPS wardriving
 
-GPS is handled Flask-side, since the ESP32 radio is dedicated to sniffing and there's no on-device AP. Two options:
+There are now three options — pick whichever matches your kit:
 
-- **USB NMEA puck** plugged into the host running Flask — Flask reads NMEA and timestamps a GPS timeline
-- **Flask dashboard open in a phone browser** — browser Geolocation API posts updates to Flask
+- **On-device UART NMEA module** (recommended for headless wardrives — no phone, no laptop). Wire any 9600-baud NMEA GPS (u-blox NEO-6M / NEO-M8N / BN-220 / GT-U7 / ATGM336H, etc.) to UART2 on the XIAO. The firmware parses `$GxGGA` / `$GxRMC`, embeds `gps:{latitude,longitude,accuracy,altitude,hdop,satellites,fix_quality}` on every emitted detection JSON line, and tags each on-device SPIFFS record with the lat/lon at sighting (schema `v:2`). Wardrives done with no host attached come back already geo-tagged.
+- **USB NMEA puck** plugged into the host running Flask — Flask reads NMEA and timestamps a GPS timeline.
+- **Flask dashboard open in a phone browser** — browser Geolocation API posts updates to Flask.
 
-Flask does a temporal match between detection timestamp and GPS timeline, then exports JSON / CSV / KML for Google Earth.
+Flask still does a temporal match between detection timestamp and GPS timeline for the host-side options, and exports JSON / CSV / KML for Google Earth either way.
+
+#### On-device GPS wiring
+
+| GPS pin | XIAO ESP32-S3 pin | Notes |
+|---------|-------------------|-------|
+| VCC | 5V (or 3V3) | Module's onboard regulator handles either |
+| GND | GND | |
+| TX | D7 / GPIO44 | Firmware reads this on UART2 @ 9600 baud |
+| RX | (leave floating) | Firmware never transmits to the GPS |
+
+After flashing, watch the serial heartbeat for `gps=lat,lon sats=N hdop=...` (good fix) or `gps=no_fix` (still acquiring — cold-start outdoors is typically 30–60 s). To disable on-device GPS, set `USE_GPS 0` at the top of `main.cpp`.
 
 ### Running Flask
 
@@ -196,6 +210,7 @@ Open `http://localhost:5000`, pick your serial port from the UI, detections star
 | GPIO 3 | Piezo buzzer |
 | GPIO 21 | Onboard user LED (active low) |
 | GPIO 43 | Serial1 TX mirror (115200 baud) |
+| GPIO 44 (D7) | UART2 RX — on-device NMEA GPS (9600 baud, optional) |
 
 Boot sound: first 6 notes of Super Mario Bros. World 1-2 (underground).
 
@@ -232,6 +247,10 @@ pio device monitor          # serial output
 | `AUTOSAVE_INTERVAL_MS` | 60000 | SPIFFS save cadence |
 | `LED_PIN` | 21 | Onboard user LED |
 | `BUZZER_PIN` | 3 | Piezo |
+| `USE_GPS` | 1 | On-device UART NMEA GPS reader |
+| `GPS_RX_PIN` | 44 | XIAO D7 — wire GPS TX here |
+| `GPS_BAUD` | 9600 | Default for u-blox / GT-U7 / BN-220 / ATGM336H |
+| `GPS_FIX_TIMEOUT_MS` | 10000 | Mark fix stale after N ms with no NMEA update |
 
 ---
 
