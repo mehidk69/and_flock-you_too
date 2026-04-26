@@ -152,6 +152,39 @@ CRC32 uses the standard `0xEDB88320` polynomial so the same file can be verified
 
 ---
 
+## microSD logging (optional)
+
+For wardrives that exceed the 200-MAC SPIFFS cap, wire a microSD breakout to the SPI pads on the back of the XIAO. SPIFFS keeps doing its dedup-by-MAC job; SD adds an append-only NDJSON log of every emitted detection (no dedup) so you can sweep up days of data on one card.
+
+### Wiring
+
+| SD breakout pin | XIAO ESP32-S3 pin | Notes |
+|---|---|---|
+| VCC | 5V (or 3V3) | Most breakouts have an onboard 3V3 reg |
+| GND | GND | |
+| SCK / CLK | D8 / GPIO7 | |
+| MISO / DO | D9 / GPIO8 | |
+| MOSI / DI | D10 / GPIO9 | |
+| CS / SS | D3 / GPIO4 | |
+
+If no card is present at boot, the firmware logs `SD not detected` and continues — SD failure is non-fatal.
+
+### Log format (`/flockyou.ndjson`)
+
+One JSON object per line. A boot marker is emitted on every startup so sessions can be split in post-processing:
+
+```
+{"event":"boot","ts":1234,"reset_reason":1,"firmware":"flockyou-promiscuous"}
+{"event":"detection","detection_method":"wifi_wildcard_probe",...,"ts":5678,"gps":{...}}
+{"event":"detection","detection_method":"wifi_oui_addr1",...,"ts":5901,"gps":{...}}
+```
+
+Each detection line is the same shape as the live USB JSON (with the `gps` sub-object when a fix is valid), plus a `ts` field with `millis()` for ordering. Writes are flushed every 5 s so most of the log survives an unclean shutdown.
+
+To disable SD entirely, set `USE_SD 0` at the top of `main.cpp`.
+
+---
+
 ## Flask dashboard integration
 
 The firmware emits one JSON line per detection in the same schema the BLE detector uses, so `api/flockyou.py` picks it up with zero changes:
@@ -211,6 +244,10 @@ Open `http://localhost:5000`, pick your serial port from the UI, detections star
 | GPIO 21 | Onboard user LED (active low) |
 | GPIO 43 | Serial1 TX mirror (115200 baud) |
 | GPIO 44 (D7) | UART2 RX — on-device NMEA GPS (9600 baud, optional) |
+| GPIO 7 (D8) | SPI SCK — microSD (optional) |
+| GPIO 8 (D9) | SPI MISO — microSD (optional) |
+| GPIO 9 (D10) | SPI MOSI — microSD (optional) |
+| GPIO 4 (D3) | SPI CS — microSD (optional) |
 
 Boot sound: first 6 notes of Super Mario Bros. World 1-2 (underground).
 
@@ -251,16 +288,20 @@ pio device monitor          # serial output
 | `GPS_RX_PIN` | 44 | XIAO D7 — wire GPS TX here |
 | `GPS_BAUD` | 9600 | Default for u-blox / GT-U7 / BN-220 / ATGM336H |
 | `GPS_FIX_TIMEOUT_MS` | 10000 | Mark fix stale after N ms with no NMEA update |
+| `USE_SD` | 1 | microSD logging over SPI |
+| `SD_CS_PIN` | 4 | XIAO D3 — wire SD CS here |
+| `SD_LOG_PATH` | `/flockyou.ndjson` | Append-only NDJSON log on the card |
+| `SD_FLUSH_INTERVAL_MS` | 5000 | Flush cadence — survives power loss |
 
 ---
 
 ## Standalone vs connected
 
-**Without USB:** device boots, plays the SMB 1-2 intro, starts scanning, stores every unique detection to SPIFFS, flashes the onboard LED on each hit. Plug in later — the prior session is sitting in `/prev_session.json`.
+**Without USB:** device boots, plays the SMB 1-2 intro, starts scanning, stores every unique detection to SPIFFS, flashes the onboard LED on each hit. With on-device GPS attached, each entry is geo-tagged. With a microSD card attached, every detection is also appended to `/flockyou.ndjson` on the card. Plug in later — the prior session is sitting in `/prev_session.json` and the full rolling log is on the SD.
 
-**With USB + Flask running:** same thing, plus every detection streams live to the dashboard as a JSON line. Flask adds GPS (if configured) and deduplicates across MAC, building the wardriving map as you move.
+**With USB + Flask running:** same thing, plus every detection streams live to the dashboard as a JSON line. Flask adds GPS (if no on-device module is wired) and deduplicates across MAC, building the wardriving map as you move.
 
-Both modes work simultaneously — the SPIFFS write path doesn't care if a host is listening.
+All sinks (SPIFFS, SD, USB) work simultaneously and independently — none cares whether the others are present.
 
 ---
 

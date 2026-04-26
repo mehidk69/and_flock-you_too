@@ -4,6 +4,8 @@
 #include <ctype.h>
 #include <string.h>
 #include <SPIFFS.h>
+#include <SPI.h>
+#include <SD.h>
 
 // ============================================================
 // CONFIG
@@ -37,6 +39,26 @@
 #define GPS_BAUD               9600
 #define GPS_UART_NUM           2
 #define GPS_FIX_TIMEOUT_MS     10000   // mark fix stale after this many ms with no update
+
+// On-device microSD card logging (SPI). Optional but recommended for
+// long wardrives — SPIFFS caps at MAX_DETECTIONS unique MACs and ~1.9 MB,
+// SD writes append a rolling NDJSON line per detection (no dedup) so the
+// only practical limit is card size.
+//
+// Wiring (Seeed XIAO ESP32-S3):
+//   SD VCC → 5V (or 3V3)         Most breakouts have an onboard regulator
+//   SD GND → GND
+//   SD SCK → D8 / GPIO7
+//   SD MISO → D9 / GPIO8
+//   SD MOSI → D10 / GPIO9
+//   SD CS  → D3 / GPIO4
+#define USE_SD                 1
+#define SD_SCK_PIN             7
+#define SD_MISO_PIN            8
+#define SD_MOSI_PIN            9
+#define SD_CS_PIN              4
+#define SD_LOG_PATH            "/flockyou.ndjson"
+#define SD_FLUSH_INTERVAL_MS   5000
 
 #define CHANNEL_MODE_FULL_HOP   0
 #define CHANNEL_MODE_CUSTOM     1
@@ -217,6 +239,12 @@ static bool          fySpiffsReady    = false;
 static bool          fyDirty          = false;
 static unsigned long fyLastSaveAt     = 0;
 static int           fyLastSaveCount  = 0;
+
+// SD log counters live here so printHeartbeat() can read them without
+// needing the SD module's File handle in scope.
+static bool          sdReady          = false;
+static uint32_t      sdBytesWritten   = 0;
+static uint32_t      sdLinesWritten   = 0;
 
 // ============================================================
 // STATE
@@ -478,20 +506,31 @@ static void updateChannelMode() {
 
 static void printHeartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
+    char gpsBuf[64];
 #if USE_GPS
     if (gpsFix.valid) {
-      dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d gps=%.6f,%.6f sats=%u hdop=%.1f)\n",
-                 currentChannel, channelModeName(), fyDetCount,
-                 gpsFix.lat, gpsFix.lon,
-                 (unsigned)gpsFix.satellites, gpsFix.hdop);
+      snprintf(gpsBuf, sizeof(gpsBuf), " gps=%.6f,%.6f sats=%u hdop=%.1f",
+               gpsFix.lat, gpsFix.lon,
+               (unsigned)gpsFix.satellites, gpsFix.hdop);
     } else {
-      dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d gps=no_fix)\n",
-                 currentChannel, channelModeName(), fyDetCount);
+      strlcpy(gpsBuf, " gps=no_fix", sizeof(gpsBuf));
     }
 #else
-    dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d)\n",
-                  currentChannel, channelModeName(), fyDetCount);
+    gpsBuf[0] = '\0';
 #endif
+    char sdBuf[64];
+#if USE_SD
+    if (sdReady) {
+      snprintf(sdBuf, sizeof(sdBuf), " sd=%lu_lines/%luB",
+               (unsigned long)sdLinesWritten, (unsigned long)sdBytesWritten);
+    } else {
+      strlcpy(sdBuf, " sd=off", sizeof(sdBuf));
+    }
+#else
+    sdBuf[0] = '\0';
+#endif
+    dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d%s%s)\n",
+               currentChannel, channelModeName(), fyDetCount, gpsBuf, sdBuf);
     lastHeartbeat = millis();
   }
 }
@@ -666,6 +705,88 @@ static float gpsAccuracyMetres(float hdop) {
 }
 #else
 static inline void gpsTick() {}
+#endif
+
+// ============================================================
+// SD CARD  (microSD over SPI, append-only NDJSON log)
+// ============================================================
+//
+// One line per emitted detection appended to SD_LOG_PATH. Same JSON shape
+// as the live USB schema (so the same downstream tooling parses it). A
+// boot marker line is written at startup so wardrives can be split per
+// session in post.
+//
+// All SD I/O happens in loop() context — never in the WiFi callback.
+// Writes are buffered by the SD library and explicitly flushed on a
+// timer (SD_FLUSH_INTERVAL_MS) so we don't pay the ~50–200 ms internal
+// garbage-collect penalty on every detection.
+
+#if USE_SD
+// sdReady, sdBytesWritten, sdLinesWritten are declared with the global
+// state block at the top of the file so the heartbeat printer can read
+// them without depending on this module's File handle.
+static File          sdLogFile;
+static unsigned long sdLastFlushAt  = 0;
+
+static bool sdInit() {
+  // Pin args go SCK, MISO, MOSI; CS is managed by the SD driver via SD.begin().
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN);
+  // 4 MHz init clock — the SD library will renegotiate after card type
+  // detection. Conservative on a long flying-lead breakout cable.
+  if (!SD.begin(SD_CS_PIN, SPI, 4000000)) {
+    return false;
+  }
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    SD.end();
+    return false;
+  }
+  sdLogFile = SD.open(SD_LOG_PATH, FILE_APPEND);
+  if (!sdLogFile) {
+    SD.end();
+    return false;
+  }
+  sdReady       = true;
+  sdLastFlushAt = millis();
+  return true;
+}
+
+static void sdAppendLine(const char* line, size_t len) {
+  if (!sdReady || !sdLogFile) return;
+  size_t w = sdLogFile.write((const uint8_t*)line, len);
+  if (w != len) {
+    // Card pulled, full, or write fault — close and stop trying so we
+    // don't spam errors. Reboot to retry.
+    sdLogFile.close();
+    sdReady = false;
+    return;
+  }
+  sdBytesWritten += (uint32_t)w;
+  sdLinesWritten++;
+}
+
+static void sdFlushTick() {
+  if (!sdReady || !sdLogFile) return;
+  if (millis() - sdLastFlushAt < SD_FLUSH_INTERVAL_MS) return;
+  sdLogFile.flush();
+  sdLastFlushAt = millis();
+}
+
+static void sdWriteBootMarker() {
+  if (!sdReady) return;
+  char line[160];
+  // reset_reason is useful when chasing down brownouts mid-wardrive
+  int n = snprintf(line, sizeof(line),
+      "{\"event\":\"boot\",\"ts\":%lu,\"reset_reason\":%d,"
+      "\"firmware\":\"flockyou-promiscuous\"}\n",
+      (unsigned long)millis(), (int)esp_reset_reason());
+  if (n > 0 && (size_t)n < sizeof(line)) sdAppendLine(line, (size_t)n);
+}
+#else
+static inline bool sdInit()             { return false; }
+static inline void sdAppendLine(const char*, size_t) {}
+static inline void sdFlushTick()        {}
+static inline void sdWriteBootMarker()  {}
 #endif
 
 // ============================================================
@@ -1039,7 +1160,10 @@ static void emitDetectionJSON(const char* mac, const char* method,
   }
 #endif
 
-  dualPrintf(
+  // Build into a local buffer once so the same line goes to USB CDC, the
+  // debug TX mirror, and the SD log without re-formatting three times.
+  char line[640];
+  int n = snprintf(line, sizeof(line),
       "{\"event\":\"detection\","
       "\"detection_method\":\"wifi_%s\","
       "\"protocol\":\"wifi_2_4ghz\","
@@ -1049,9 +1173,18 @@ static void emitDetectionJSON(const char* mac, const char* method,
       "\"rssi\":%d,"
       "\"channel\":%u,"
       "\"frequency\":%u,"
+      "\"ts\":%lu,"
       "\"ssid\":\"%s\"%s}\n",
       method, mac, oui, rssi,
-      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc, gpsBuf);
+      (unsigned)ch, (unsigned)channelFreqMhz(ch),
+      (unsigned long)millis(), ssidEsc, gpsBuf);
+  if (n <= 0 || (size_t)n >= sizeof(line)) return;
+
+  Serial.write((const uint8_t*)line, (size_t)n);
+#if MIRROR_SERIAL
+  Serial1.write((const uint8_t*)line, (size_t)n);
+#endif
+  sdAppendLine(line, (size_t)n);
 }
 
 // ============================================================
@@ -1355,6 +1488,17 @@ void setup() {
     dualPrintln("[flockyou] SPIFFS init FAILED — running without persistence");
   }
 
+#if USE_SD
+  // SD — non-fatal: if no card, just skip and run with SPIFFS-only persistence.
+  if (sdInit()) {
+    dualPrintf("[flockyou] SD ready (CS=GPIO%u, log=%s)\n",
+               (unsigned)SD_CS_PIN, SD_LOG_PATH);
+    sdWriteBootMarker();
+  } else {
+    dualPrintln("[flockyou] SD not detected — continuing without SD log");
+  }
+#endif
+
   WiFi.mode(WIFI_MODE_NULL);
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   esp_wifi_init(&cfg);
@@ -1391,6 +1535,7 @@ void loop() {
   gpsTick();           // drain UART2, parse NMEA, refresh gpsFix
   drainAlertQueue();   // Serial.printf happens here, not in callback
   autosaveTick();      // periodic SPIFFS write if dirty
+  sdFlushTick();       // periodic SD flush so writes survive power loss
   heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
   printHeartbeat();
